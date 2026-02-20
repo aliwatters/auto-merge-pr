@@ -1,0 +1,206 @@
+name: "Auto-Merge PR"
+description: "Enable auto-merge on eligible PRs when checks pass. Supports configurable token for triggering downstream workflows."
+author: "Ali Watters"
+
+branding:
+  icon: "git-merge"
+  color: "green"
+
+inputs:
+  token:
+    description: "GitHub token with contents:write and pull-requests:write permissions. Use a PAT or GitHub App token to trigger downstream workflows."
+    required: false
+    default: ${{ github.token }}
+  merge-method:
+    description: "Merge method to use (squash, merge, rebase)"
+    required: false
+    default: "squash"
+  required-labels:
+    description: "Comma-separated list of labels that opt a PR into auto-merge (empty = rely on GitHub auto-merge flag only)"
+    required: false
+    default: "automerge"
+  exclude-labels:
+    description: "Comma-separated list of labels that exclude a PR from auto-merge"
+    required: false
+    default: "no-automerge"
+  auto-approve-dependabot:
+    description: "Auto-approve and auto-merge minor/patch Dependabot PRs"
+    required: false
+    default: "true"
+
+outputs:
+  result:
+    description: "Result of the auto-merge attempt (merged, skipped, blocked, error)"
+    value: ${{ steps.merge.outputs.result }}
+  pr-number:
+    description: "PR number that was processed"
+    value: ${{ steps.detect.outputs.number }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect PR number
+      id: detect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+        PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
+        CHECK_SUITE_PRS: ${{ toJSON(github.event.check_suite.pull_requests) }}
+      run: |
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          echo "number=$PR_NUMBER_EVENT" >> "$GITHUB_OUTPUT"
+        elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          echo "number=$PR_NUMBER_INPUT" >> "$GITHUB_OUTPUT"
+        elif [ "$EVENT_NAME" = "check_suite" ]; then
+          PR_NUM=$(echo "$CHECK_SUITE_PRS" | jq -r '.[0].number // empty')
+          if [ -z "$PR_NUM" ]; then
+            echo "No PR associated with this check suite. Skipping."
+            echo "number=" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "Unsupported event: $EVENT_NAME"
+          echo "number=" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Attempt auto-merge
+      id: merge
+      if: steps.detect.outputs.number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.detect.outputs.number }}
+        MERGE_METHOD: ${{ inputs.merge-method }}
+        REQUIRED_LABELS: ${{ inputs.required-labels }}
+        EXCLUDE_LABELS: ${{ inputs.exclude-labels }}
+      run: |
+        echo "Checking PR #$PR_NUMBER for auto-merge eligibility..."
+
+        # Get PR metadata
+        PR_DATA=$(gh pr view "$PR_NUMBER" -R "$GH_REPO" \
+          --json state,isDraft,labels,mergeStateStatus,mergeable,autoMergeRequest \
+          --jq '{
+            state: .state,
+            draft: .isDraft,
+            labels: [.labels[].name],
+            merge_state: .mergeStateStatus,
+            mergeable: .mergeable,
+            auto_merge: (.autoMergeRequest != null)
+          }')
+
+        echo "$PR_DATA" | jq .
+
+        STATE=$(echo "$PR_DATA" | jq -r '.state')
+        IS_DRAFT=$(echo "$PR_DATA" | jq -r '.draft')
+        MERGE_STATE=$(echo "$PR_DATA" | jq -r '.merge_state')
+        MERGEABLE=$(echo "$PR_DATA" | jq -r '.mergeable')
+        AUTO_MERGE=$(echo "$PR_DATA" | jq -r '.auto_merge')
+
+        # Check exclude labels
+        IFS=',' read -ra EXCLUDES <<< "$EXCLUDE_LABELS"
+        for label in "${EXCLUDES[@]}"; do
+          label=$(echo "$label" | xargs)
+          HAS_EXCLUDE=$(echo "$PR_DATA" | jq --arg l "$label" '.labels | any(. == $l)')
+          if [ "$HAS_EXCLUDE" = "true" ]; then
+            echo "PR has exclude label '$label'. Skipping."
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+
+        # Check required labels
+        HAS_REQUIRED=false
+        if [ -n "$REQUIRED_LABELS" ]; then
+          IFS=',' read -ra REQUIRES <<< "$REQUIRED_LABELS"
+          for label in "${REQUIRES[@]}"; do
+            label=$(echo "$label" | xargs)
+            HAS_LABEL=$(echo "$PR_DATA" | jq --arg l "$label" '.labels | any(. == $l)')
+            if [ "$HAS_LABEL" = "true" ]; then
+              HAS_REQUIRED=true
+              break
+            fi
+          done
+        fi
+
+        # Bail conditions
+        if [ "$STATE" != "OPEN" ]; then
+          echo "PR is not open ($STATE). Skipping."
+          echo "result=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$IS_DRAFT" = "true" ]; then
+          echo "PR is a draft. Skipping."
+          echo "result=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Must have auto-merge enabled or a required label
+        if [ "$AUTO_MERGE" != "true" ] && [ "$HAS_REQUIRED" != "true" ]; then
+          echo "PR has neither auto-merge enabled nor a required label. Skipping."
+          echo "result=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Check merge readiness
+        if [ "$MERGEABLE" = "CONFLICTING" ]; then
+          echo "PR has merge conflicts. Cannot auto-merge."
+          echo "result=blocked" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$MERGE_STATE" = "BLOCKED" ]; then
+          echo "PR is blocked (checks haven't passed). Skipping for now."
+          echo "result=blocked" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Enable auto-merge
+        echo "Enabling auto-merge for PR #$PR_NUMBER (method: $MERGE_METHOD)..."
+        gh pr merge "$PR_NUMBER" -R "$GH_REPO" --"$MERGE_METHOD" --auto || {
+          echo "Failed to enable auto-merge. Checks may still be pending."
+          echo "result=error" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        echo "result=merged" >> "$GITHUB_OUTPUT"
+        echo "Auto-merge enabled for PR #$PR_NUMBER"
+
+    - name: Dependabot auto-approve
+      if: >-
+        inputs.auto-approve-dependabot == 'true' &&
+        github.event_name == 'pull_request' &&
+        github.actor == 'dependabot[bot]'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        MERGE_METHOD: ${{ inputs.merge-method }}
+      run: |
+        echo "Checking Dependabot PR #$PR_NUMBER..."
+
+        TITLE=$(gh pr view "$PR_NUMBER" -R "$GH_REPO" --json title --jq '.title')
+        echo "Title: $TITLE"
+
+        # Skip major version bumps (require manual review)
+        if echo "$TITLE" | grep -qiE 'from [0-9]+\.[0-9]+\.[0-9]+ to [0-9]+\.'; then
+          OLD_MAJOR=$(echo "$TITLE" | grep -oE 'from ([0-9]+)\.' | head -1 | grep -oE '[0-9]+')
+          NEW_MAJOR=$(echo "$TITLE" | grep -oE 'to ([0-9]+)\.' | head -1 | grep -oE '[0-9]+')
+
+          if [ -n "$OLD_MAJOR" ] && [ -n "$NEW_MAJOR" ] && [ "$OLD_MAJOR" != "$NEW_MAJOR" ]; then
+            echo "Major version bump ($OLD_MAJOR -> $NEW_MAJOR). Skipping auto-approve."
+            exit 0
+          fi
+        fi
+
+        echo "Approving Dependabot PR #$PR_NUMBER (minor/patch update)..."
+        gh pr review "$PR_NUMBER" -R "$GH_REPO" --approve --body "Auto-approved: minor/patch dependency update"
+
+        gh pr merge "$PR_NUMBER" -R "$GH_REPO" --"$MERGE_METHOD" --auto || true
+        echo "Auto-approved and auto-merge enabled"
